@@ -57,7 +57,24 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        if entity["kind"] == "task":
+            self._void_pending_handovers(actor, entity_id)
         return updated
+
+    def _void_pending_handovers(self, actor, task_id, reason="task status changed"):
+        pending = [
+            handover
+            for handover in self.repository.find_entities("handover", "*", None)
+            if handover["data"].get("task_id") == task_id and handover["status"] == "pending"
+        ]
+        for handover in pending:
+            merged = dict(handover["data"])
+            merged["void_reason"] = reason
+            self.repository.update_entity(handover["id"], handover["version"], "void", merged)
+            self.audit.record(
+                handover["id"], actor, "void", "pending", "void",
+                {"reason": reason, "task_id": task_id},
+            )
 
     def merge_offline(self, actor, records):
         """Merge field records by a stable (source_id, record_id) identity."""
@@ -79,6 +96,9 @@ class DomainService:
                 continue
             payload = dict(raw)
             self.rules.validate_create(actor, "offline_record", payload, self._lookup)
+            inner = payload.get("payload")
+            if isinstance(inner, dict) and inner.get("record_type") == "handover":
+                self._materialize_handover(actor, source_id, record_id, inner)
             entity = self.repository.create_entity(
                 entity_id,
                 "offline_record",
@@ -89,6 +109,25 @@ class DomainService:
             self.audit.record(entity_id, actor, "merge_offline", None, entity["status"], {"source_id": source_id, "record_id": record_id})
             created.append(entity)
         return created
+
+    def _materialize_handover(self, actor, source_id, record_id, payload):
+        """Turn an offline handover record into a pending handover once."""
+        digest = hashlib.sha256((source_id + "\0" + record_id).encode("utf-8")).hexdigest()[:32]
+        handover_id = "handover-" + digest
+        if self.repository.get_entity(handover_id):
+            return
+        data = {
+            "task_id": payload.get("task_id"),
+            "from_team": payload.get("from_team"),
+            "to_team": payload.get("to_team"),
+            "pending_work": payload.get("pending_work"),
+        }
+        data = self.rules.validate_create(actor, "handover", data, self._lookup)
+        self.repository.create_entity(handover_id, "handover", "pending", data, actor.user_id)
+        self.audit.record(
+            handover_id, actor, "merge_handover", None, "pending",
+            {"source_id": source_id, "record_id": record_id},
+        )
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

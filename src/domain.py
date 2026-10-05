@@ -39,6 +39,7 @@ class Role(str, Enum):
 class Actor:
     user_id: str
     role: str
+    team: Optional[str] = None
 
     @classmethod
     def from_headers(cls, headers):
@@ -46,7 +47,8 @@ class Actor:
         role = headers.get("X-Role", "viewer")
         if role not in {item.value for item in Role}:
             raise PermissionDenied("unknown role: " + role)
-        return cls(user_id=user_id, role=role)
+        team = headers.get("X-Team") or None
+        return cls(user_id=user_id, role=role, team=team)
 
 
 @dataclass
