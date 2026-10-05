@@ -82,23 +82,103 @@ def _validate_offline(data):
         raise ValidationError("recorded_at must be ISO-8601")
 
 
+def _actor_team(actor, data, lookup):
+    """Resolve the team an actor belongs to.
+
+    The worker roster is authoritative; the explicit ``team`` claim in the
+    request data is a prototype fallback for actors without a worker record.
+    """
+    for worker in _all(lookup, "worker"):
+        if worker["id"] == actor.user_id or worker["data"].get("name") == actor.user_id:
+            return worker["data"].get("team")
+    return (data or {}).get("team")
+
+
+def _validate_handover(actor, data, lookup):
+    task = _find_one(lookup, "task", "id", data.get("task_id"))
+    if not task:
+        raise ValidationError("handover requires an existing task")
+    if task["status"] not in ("assigned", "in_progress"):
+        raise ValidationError("handover requires an active task")
+    from_team = str(data.get("from_team") or "").strip()
+    to_team = str(data.get("to_team") or "").strip()
+    if not from_team or not to_team:
+        raise ValidationError("from_team and to_team are required")
+    if from_team == to_team:
+        raise ValidationError("from_team and to_team must differ")
+    if task["data"].get("responsible_team") != from_team:
+        raise ValidationError("from_team does not hold responsibility for the task")
+    if actor.role == "field" and _actor_team(actor, data, lookup) != from_team:
+        raise PermissionDenied("only the responsible team may hand over the task")
+    items = data.get("pending_items")
+    if isinstance(items, str) and not items.strip():
+        raise ValidationError("pending_items must describe unfinished work")
+    if isinstance(items, list) and not [item for item in items if str(item).strip()]:
+        raise ValidationError("pending_items must describe unfinished work")
+    for handover in _all(lookup, "handover"):
+        if handover["data"].get("task_id") == task["id"] and handover["status"] == "pending":
+            raise ConflictError("pending handover already exists for task: " + task["id"])
+    data["task_status"] = task["status"]
+
+
 def _sensor_alarm(actor, entity, data, lookup):
     if float(entity["data"].get("gas_ppm", 0)) < float(entity["data"].get("threshold_ppm", 1)):
         raise ValidationError("alarm requires a reading at or above threshold")
     return {"acknowledged_by": actor.user_id}
 
 
+def _require_task_team(actor, entity, data, lookup):
+    """Field actors may only work tasks their team is responsible for."""
+    team = entity["data"].get("responsible_team")
+    if not team or actor.role != "field":
+        return
+    if _actor_team(actor, data, lookup) != team:
+        raise PermissionDenied("actor's team no longer holds responsibility for the task")
+
+
+def _assign_task(actor, entity, data, lookup):
+    return {"responsible_team": data.get("team"), "assigned_by": actor.user_id}
+
+
+def _reassign_task(actor, entity, data, lookup):
+    return {"responsible_team": data.get("team"), "reassigned_by": actor.user_id}
+
+
+def _accept_task(actor, entity, data, lookup):
+    _require_task_team(actor, entity, data, lookup)
+    return {"accepted_by": actor.user_id}
+
+
 def _complete_task(actor, entity, data, lookup):
+    _require_task_team(actor, entity, data, lookup)
     if not str(data.get("result", "")).strip():
         raise ValidationError("result is required")
     return {"completed_by": actor.user_id}
 
 
+def _confirm_handover(actor, entity, data, lookup):
+    task = _find_one(lookup, "task", "id", entity["data"].get("task_id"))
+    if not task:
+        raise ValidationError("handover task no longer exists")
+    if task["status"] != entity["data"].get("task_status"):
+        raise ConflictError("task changed since handover; dispatcher must re-assign")
+    if actor.role == "field" and _actor_team(actor, data, lookup) != entity["data"].get("to_team"):
+        raise PermissionDenied("only the receiving team may confirm the handover")
+    return {"confirmed_by": actor.user_id}
+
+
+def _void_handover(actor, entity, data, lookup):
+    return {"voided_by": actor.user_id, "void_reason": data.get("reason")}
+
+
 def _close_incident(actor, entity, data, lookup):
     if [w for w in _all(lookup, "worker") if w["status"] in ("missing", "located")]:
         raise ConflictError("cannot close incident while workers are missing or located")
-    active_tasks = [t for t in _all(lookup, "task") if t["status"] not in ("completed", "cancelled")]
-    if active_tasks:
+    incomplete = [t for t in _all(lookup, "task") if t["status"] not in ("completed", "cancelled")]
+    ownerless = sorted(t["id"] for t in incomplete if not t["data"].get("responsible_team"))
+    if ownerless:
+        raise ConflictError("tasks lack a responsible team: " + ", ".join(ownerless))
+    if incomplete:
         raise ConflictError("cannot close incident while tasks remain active")
     if [v for v in _all(lookup, "ventilation") if v["status"] != "running"]:
         raise ConflictError("cannot close incident until ventilation is restored")
@@ -109,12 +189,13 @@ class RuleEngine:
     ALIASES = {
         "workers": "worker", "sensors": "sensor", "ventilations": "ventilation",
         "passages": "passage", "refuges": "refuge", "incidents": "incident",
-        "tasks": "task", "offline-records": "offline_record", "offline_records": "offline_record",
+        "tasks": "task", "handovers": "handover",
+        "offline-records": "offline_record", "offline_records": "offline_record",
     }
     INITIAL_STATUS = {
         "worker": "active", "sensor": "normal", "ventilation": "running",
         "passage": "open", "refuge": "available", "incident": "detected",
-        "task": "proposed", "offline_record": "merged",
+        "task": "proposed", "handover": "pending", "offline_record": "merged",
     }
     TRANSITIONS = {
         "worker": {
@@ -158,9 +239,14 @@ class RuleEngine:
         },
         "task": {
             "assign": (("proposed",), "assigned"),
+            "reassign": (("assigned", "in_progress"), "assigned"),
             "accept": (("assigned",), "in_progress"),
             "complete": (("in_progress",), "completed"),
             "cancel": (("proposed", "assigned", "in_progress"), "cancelled"),
+        },
+        "handover": {
+            "confirm": (("pending",), "confirmed"),
+            "void": (("pending",), "void"),
         },
     }
     CREATE_REQUIRED = {
@@ -171,6 +257,7 @@ class RuleEngine:
         "refuge": ("location_code", "capacity"),
         "incident": ("area_code", "severity", "summary"),
         "task": ("incident_id", "task_type", "target", "dedupe_key"),
+        "handover": ("task_id", "from_team", "to_team", "pending_items"),
         "offline_record": ("source_id", "record_id", "recorded_at", "payload"),
     }
     ACTION_REQUIRED = {
@@ -179,8 +266,11 @@ class RuleEngine:
         ("ventilation", "restore"): ("tested_at",),
         ("ventilation", "degrade"): ("reason",),
         ("incident", "close"): ("summary",),
+        ("task", "assign"): ("team",),
+        ("task", "reassign"): ("team",),
         ("task", "complete"): ("result",),
         ("task", "cancel"): ("reason",),
+        ("handover", "void"): ("reason",),
     }
     CREATE_ROLES = {
         "worker": ("admin", "safety", "dispatcher"),
@@ -190,6 +280,7 @@ class RuleEngine:
         "refuge": ("admin", "safety"),
         "incident": ("admin", "safety", "dispatcher"),
         "task": ("admin", "dispatcher", "safety"),
+        "handover": ("admin", "dispatcher", "safety", "field"),
         "offline_record": ("admin", "safety", "dispatcher", "field"),
     }
     ROLE_ACTIONS = {
@@ -220,9 +311,12 @@ class RuleEngine:
         "recover": ("admin", "safety", "dispatcher"),
         "close": ("admin", "safety"),
         "assign": ("admin", "dispatcher", "safety"),
+        "reassign": ("admin", "dispatcher", "safety"),
         "accept": ("admin", "field", "dispatcher"),
         "complete": ("admin", "field", "dispatcher"),
         "cancel": ("admin", "dispatcher", "safety"),
+        "confirm": ("admin", "dispatcher", "safety", "field"),
+        "void": ("admin", "dispatcher", "safety"),
     }
     CUSTOM_CREATE = {
         "worker": lambda a, d, l: _validate_worker(d),
@@ -232,12 +326,18 @@ class RuleEngine:
         "refuge": lambda a, d, l: _validate_capacity(d, "capacity"),
         "incident": lambda a, d, l: _validate_incident(d),
         "task": lambda a, d, l: _validate_task(d, l),
+        "handover": lambda a, d, l: _validate_handover(a, d, l),
         "offline_record": lambda a, d, l: _validate_offline(d),
     }
     CUSTOM_TRANSITIONS = {
         ("sensor", "raise_alarm"): _sensor_alarm,
         ("incident", "close"): _close_incident,
+        ("task", "assign"): _assign_task,
+        ("task", "reassign"): _reassign_task,
+        ("task", "accept"): _accept_task,
         ("task", "complete"): _complete_task,
+        ("handover", "confirm"): _confirm_handover,
+        ("handover", "void"): _void_handover,
     }
 
     def normalize_kind(self, kind):
